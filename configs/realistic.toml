@@ -1,0 +1,138 @@
+# Реалистичная модель: полосы МЦМ/ФД/WDM, шумы лазера и ФД, конечный ER.
+# Единственное место с частотами по умолчанию. Частоты в ГГц.
+
+[plan]
+fc_GHz = 30.0
+f_lo_GHz = [5.5, 9.0, 17.0]
+direction = "lower"          # lower: |2 f_i - fc|; upper: 2 f_i + fc
+wdm_spacing_GHz = 100.0
+
+[signal]
+Rs_GBd = 1.0
+alpha = 0.35
+n_sym = 16384
+M = 4
+seed = 1
+SpS = "auto"
+pulse = "rrc"              # rrc | rect
+
+[modulators]
+beta1 = 1.0
+beta_m = 0.5
+Vpi = 2.0
+bias_err = 0.0           # уход смещения MZM1, доля Vpi
+er_enabled = true
+er_dB = 30.0
+
+[laser]
+noise = true
+P_dBm = 10.0
+rin_dBHz = -150.0
+linewidth_Hz = 1.0e6
+
+[pd]
+noise = true
+R = 0.7
+RL = 50.0
+T_C = 25.0
+amp_nf_dB = 3.0      # усилитель после ФД (0 — выключен)
+
+[losses]                  # вносимые потери, дБ
+mzm1_dB = 5.0
+mux_dB = 3.0
+mzm2_dB = 5.0
+demux_dB = 3.0
+
+[input]                   # шум на входе: C/N на входе LNA в полосе Rs, каскад по Фриису
+noise = true
+cn_dB = 20.0
+nf_lna_dB = 2.0
+g_lna_dB = 30.0
+nf_driver_dB = 8.0
+bw_factor = 2.0           # срез входного BPF = bw_factor*(1+alpha)*Rs/2
+
+[edfa]                    # один EDFA после МЦМ2, до DEMUX
+enabled = true
+G_dB = 16.0
+NF_dB = 5.0
+lambda_nm = 1550.0
+
+[lo]                      # фазовый шум гетеродина
+phase_noise = true
+profile = "synth_typical"  # synth_typical | dvbs2_mask | table (тогда table = [[f_Hz, dBc/Hz], ...])
+
+[drivers]                 # нелинейность драйверов: полином через OIP3 и HD2
+nonlinear = true
+oip3_dBm = 33.0
+hd2_lo_dBc = -30.0
+hd2_sig_dBc = -40.0
+
+[bias_drift]              # дрейф смещения МЦМ1 (процесс Орнштейна-Уленбека)
+enabled = true
+sigma_pct = 2.0
+tau_s = 1.0
+
+[receiver]
+block_symbols = 256       # поблочная подстройка фазы (0 — выключена)
+
+[components.mzm1_rf]
+kind = "skin"
+f3dB_GHz = 40.0
+
+[components.mzm2_rf]
+kind = "skin"
+f3dB_GHz = 40.0
+
+[components.pd]
+kind = "rc"
+f3dB_GHz = 50.0
+order = 1
+
+[components.wdm]
+kind = "supergauss"
+f3dB_GHz = 80.0
+order = 2
+isolation_dB = 25.0
+
+[components.bpf]
+kind = "butter"            # butter | cheby1
+order = 4
+bw_factor = 2.0            # ширина = bw_factor*(1+alpha)*Rs, если bw_GHz не задана
+ripple_dB = 1.0            # для cheby1
+center = "auto"            # "auto" (следует за выходной линией), число ГГц или список по каналам
+
+[sweeps]
+fig4_flo_GHz = 9.0
+beta1_min = 0.1
+beta1_max = 3.0
+beta_m_min = 0.05
+beta_m_max = 1.5
+n_beta = 30
+n_beta_quick = 8
+n_evm = 15
+n_evm_quick = 6
+rx_dBm_min = -38.0
+rx_dBm_max = -8.0
+n_rx = 11
+n_rx_quick = 5
+cn_min_dB = 5.0
+cn_max_dB = 35.0
+n_cn = 7
+n_cn_quick = 5
+fig10_budget_cn_dB = 20.0
+fig11_sigma_pct = [0.0, 1.0, 2.0, 5.0]
+fig11_sigma_pct_quick = [0.0, 2.0, 5.0]
+n_ens = 30
+n_ens_quick = 8
+er_dB = [300.0, 40.0, 30.0, 20.0]
+fi_min_GHz = 2.0
+fi_max_GHz = 22.0
+n_fi = 21
+n_fi_quick = 8
+fig7_flo_compare_GHz = [5.0, 5.5]
+fig7_bias_err = [0.0, 0.01, 0.03, 0.1]
+
+[scenarios.up]
+fc_GHz = 14.0
+f_lo_GHz = [8.0]
+direction = "upper"
