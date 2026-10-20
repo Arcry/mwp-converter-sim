@@ -65,7 +65,7 @@ def expected_lines(i, plan, sim, comps, bias="null"):
     """
     b1, bm = effective_betas(plan, comps, sim.beta1, sim.beta_m)[i]
     amps = (lines_null if bias == "null" else lines_quad)(b1, bm)
-    fi, fc = plan.f_lo_GHz[i], plan.fc_GHz
+    fi, fc = plan.f_lo_GHz[i], plan.fc_of(i)
     out = {}
     for name, a in amps.items():
         f = 0.0 if name == "DC" else line_freq_GHz(name, fi, fc)
@@ -82,3 +82,78 @@ def bias_error_ratio(beta1, bias_err):
     отношение = |tan(pi*bias_err)| J1(2 beta1)/J2(2 beta1).
     """
     return abs(np.tan(np.pi * bias_err)) * jv(1, 2 * beta1) / jv(2, 2 * beta1)
+
+
+# ---------- многотоновая аналитика (МЦМ1 в нуле, K тонов на МЦМ2) ----------
+def multitone_products(beta_i, betas, fcs):
+    """Продукты МЦМ2 на K тонах и их амплитуды линии на выходе (ед. R*E0^2/4).
+
+    Разложение Якоби-Ангера по каждому тону; |T2|^2 = 1/2[1 - sin(2 sum beta_k sin th_k)].
+    Амплитуда линии на выходе ветки = J2(2 beta_i) * A, где A = 2 prod_k J_{n_k}(2 beta_k):
+      - тон f_ck:               2 J1(2b_k) prod_{j!=k} J0 (линия на 2f_i±f_ck и сам тон: [1-J0(2b_i)]*A);
+      - IM3 2f_ca - f_cb:       2 J2(2b_a) J1(2b_b) prod_{others} J0;
+      - тройной f_ca+f_cb-f_cc: 2 J1(2b_a) J1(2b_b) J1(2b_c) prod_{others} J0.
+    Возвращает list dict(name, kind, p_GHz, amp), где p — частота продукта во входной полосе, amp —
+    амплитуда каждой из линий 2f_i±p (kind: 'tone' | 'im3' | 'tri').
+    """
+    K = len(betas)
+    b2 = [2 * b for b in betas]
+    j0 = [jv(0, x) for x in b2]
+    j1 = [jv(1, x) for x in b2]
+    j2 = [jv(2, x) for x in b2]
+    g = 2 * jv(2, 2 * beta_i)
+
+    def others(excl):
+        return float(np.prod([j0[m] for m in range(K) if m not in excl]))
+
+    out = []
+    for k in range(K):
+        out.append(dict(name=f"tone(c{k + 1})", kind="tone", p_GHz=fcs[k], amp=abs(g * j1[k] * others({k}))))
+    for a in range(K):
+        for b in range(K):
+            if a != b:
+                out.append(dict(name=f"im3(2c{a + 1}-c{b + 1})", kind="im3", p_GHz=2 * fcs[a] - fcs[b],
+                                amp=abs(g * j2[a] * j1[b] * others({a, b}))))
+    for a in range(K):
+        for b in range(a + 1, K):
+            for c in range(K):
+                if c not in (a, b):
+                    out.append(dict(name=f"im3(c{a + 1}+c{b + 1}-c{c + 1})", kind="tri",
+                                    p_GHz=fcs[a] + fcs[b] - fcs[c],
+                                    amp=abs(g * j1[a] * j1[b] * j1[c] * others({a, b, c}))))
+    return out
+
+
+def lines_multitone(beta_i, betas, k, fcs, f_i, sideband="lower"):
+    """Амплитуды линий ветки (МЦМ1 в нуле) для несущей k: имя -> (f_ГГц, амплитуда), ед. R*E0^2/4.
+
+    Ключи: 'DC', '2fi', 'fc' (прямое просачивание несущей k), 'out' (полезная линия по боковой
+    маршрута) и по одной записи на каждый продукт IM3/тройной (частота — после переноса).
+    При K = 1 'out' совпадает с lines_null['2fi±fc'], 'fc' — с lines_null['fc'].
+    """
+    prods = multitone_products(beta_i, betas, fcs)
+    tone = next(p for p in prods if p["name"] == f"tone(c{k + 1})")
+
+    def xfer(p):
+        return abs(2 * f_i - p) if sideband == "lower" else 2 * f_i + p
+
+    d0 = 1 - jv(0, 2 * beta_i)
+    lines = {"DC": (0.0, d0), "2fi": (2 * f_i, 2 * jv(2, 2 * beta_i)),
+             "fc": (fcs[k], d0 * tone["amp"] / jv(2, 2 * beta_i)),
+             "out": (xfer(fcs[k]), tone["amp"])}
+    for p in prods:
+        if p["kind"] != "tone":
+            lines[p["name"]] = (xfer(p["p_GHz"]), p["amp"])
+    return lines
+
+
+def ci_multitone(beta_i, betas, k, fcs, f_i, sideband="lower", tol_GHz=1e-6):
+    """C/I по многотоновой аналитике: полезная линия k против IM3/тройных продуктов в её слоте.
+
+    Продукты складываются по мощности (фазы не учитываются). Возвращает dict(ci_dB, C, I, n).
+    """
+    lines = lines_multitone(beta_i, betas, k, fcs, f_i, sideband)
+    fo, C = lines["out"]
+    I2 = [a ** 2 for n, (f, a) in lines.items() if n.startswith("im3(") and abs(f - fo) < tol_GHz]
+    I = float(np.sqrt(sum(I2)))
+    return dict(ci_dB=float(20 * np.log10(C / I)) if I > 0 else float("inf"), C=float(C), I=I, n=len(I2))

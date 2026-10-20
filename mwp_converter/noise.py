@@ -13,19 +13,21 @@ def nf_cascade(nf1_dB, g1_dB, nf2_dB):
     return float(10 * np.log10(f1 + (f2 - 1) / g1))
 
 
-def input_noise(x, fs, sps, imp, sim, seed):
+def input_noise(x, fs, sps, imp, sim, seed, a_max2=1.0, span_GHz=0.0):
     """Огибающая на входе МЦМ2 с шумом: x + n (C/N на входе LNA в полосе Rs), затем входной BPF.
 
     C/N_eff = C/N - NF_total (Фрис по LNA и драйверу); дисперсия комплексного белого шума на
     отсчёт sigma^2 = SpS / 10^(C/N_eff/10) при mean|x|^2 = 1. Входной BPF — Баттерворт 4-го
-    порядка (фазово-нулевой, sosfiltfilt), срез bw_factor*(1+alpha_eff)*Rs/2.
+    порядка (фазово-нулевой, sosfiltfilt), срез bw_factor*(1+alpha_eff)*Rs/2 + span/2. При K > 1
+    C/N задаётся по самой сильной несущей (a_max2 — её мощность в композите), span — ширина
+    полосы между крайними несущими (ГГц).
     """
     nf = nf_cascade(imp.nf_lna_dB, imp.g_lna_dB, imp.nf_driver_dB)
     cn_eff = imp.input_cn_dB - nf
-    sigma2 = sps / 10 ** (cn_eff / 10)
+    sigma2 = sps * a_max2 / 10 ** (cn_eff / 10)
     rng = np.random.default_rng(seed)
     n = np.sqrt(sigma2 / 2) * (rng.normal(size=len(x)) + 1j * rng.normal(size=len(x)))
-    cut = imp.input_bw_factor * (1 + sim.alpha_eff) * sim.Rs * 1e9 / 2
+    cut = imp.input_bw_factor * (1 + sim.alpha_eff) * sim.Rs * 1e9 / 2 + span_GHz * 1e9 / 2
     sos = butter(4, cut / (fs / 2), output="sos")
     return sosfiltfilt(sos, x + n)
 

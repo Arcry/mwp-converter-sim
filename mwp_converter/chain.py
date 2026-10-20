@@ -12,6 +12,19 @@ UPTO = {"a": [0], "b": [0], "c": [0], "d": [0, 1], "m(t)": [2], "e": [0, 1, 2], 
         "BPF₃": [0, 1, 2, 3, 4, 5]}
 
 
+UPTO_TYPE = {"a": [0], "d": [0, 1], "m(t)": [2], "e": [0, 1, 2], "g": [0, 1, 2, 3], "k": [0, 1, 2, 3, 4],
+             "BPF": [0, 1, 2, 3, 4, 5]}
+# старые имена точек (ветки 1-3) -> тип; новый вид — «тип + номер ветки»
+LEGACY_POINTS = {"a": ("a", 0), "b": ("a", 1), "c": ("a", 2), "d": ("d", 0), "m(t)": ("m(t)", 0), "e": ("e", 0),
+                 "g": ("g", 0), "h": ("g", 1), "i": ("g", 2), "k": ("k", 0), "l": ("k", 1), "m": ("k", 2),
+                 "BPF₁": ("BPF", 0), "BPF₂": ("BPF", 1), "BPF₃": ("BPF", 2)}
+
+
+def _ptype(point):
+    """Тип точки: a | d | m(t) | e | g | k | BPF (принимает и старые имена b, c, h, i, l, m, BPF₁₋₃)."""
+    return LEGACY_POINTS[point][0] if point in LEGACY_POINTS else point
+
+
 def _db(resp: Response, f_GHz):
     h = np.abs(resp.H(np.atleast_1d(np.asarray(f_GHz, float)) * 1e9))
     return 20 * np.log10(np.maximum(h, 1e-6))
@@ -19,14 +32,14 @@ def _db(resp: Response, f_GHz):
 
 def useful_sidebands(plan, i):
     """Оптические боковые (ГГц, отстройка от несущей канала), формирующие выход: ±f_i и ±|f_i∓f_c|."""
-    fi, fc = plan.f_lo_GHz[i], plan.fc_GHz
-    s = abs(fi - fc) if plan.direction == "lower" else fi + fc
+    fi, fc = plan.f_lo_GHz[i], plan.fc_of(i)
+    s = abs(fi - fc) if plan.routes[i].sideband == "lower" else fi + fc
     return [fi, s]
 
 
 def stage_table(plan, sim, comps, fs, i):
     """Ослабление (дБ, положительное) каждой ступени цепочки полезной линии канала i."""
-    fi, fc = plan.f_lo_GHz[i], plan.fc_GHz
+    fi, fc = plan.f_lo_GHz[i], plan.fc_of(i)
     fo = plan.line_info(i)[0]
     bw = (1 + sim.alpha_eff) * sim.Rs
     sb = useful_sidebands(plan, i)
@@ -46,7 +59,7 @@ def chain_attenuation(point, plan, sim, comps, fs, i):
     rows = stage_table(plan, sim, comps, fs, i)
     cum = 0.0
     out = []
-    for k in UPTO[point]:
+    for k in UPTO_TYPE[_ptype(point)]:
         cum += rows[k]["att_dB"]
         out.append(dict(rows[k], cum_dB=cum))
     return out
@@ -54,34 +67,35 @@ def chain_attenuation(point, plan, sim, comps, fs, i):
 
 def response_view(point, plan, sim, comps, fs, i):
     """Данные графика АЧХ компонента точки: dict(title, xlabel, curves, marks, band, table, gd)."""
-    fi, fc = plan.f_lo_GHz[i], plan.fc_GHz
+    fi, fc = plan.f_lo_GHz[i], plan.fc_of(i)
     fo = plan.line_info(i)[0]
     bw = (1 + sim.alpha_eff) * sim.Rs
     f = np.linspace(0, 150, 750)
+    t = _ptype(point)
     v = dict(xlabel="Frequency, GHz", curves=[], marks=[], band=None, table=[], gd=None)
 
     def row(name, fq, resp):
         v["table"].append(dict(line=name, f_GHz=round(float(fq), 3), att_dB=round(float(-_db(resp, fq)[0]), 2)))
 
-    if point in ("a", "b", "c"):
+    if t == "a":
         r = comps.mzm1_rf
         v["title"] = f"MZM1 RF input, channel {i + 1}"
         v["curves"] = [("MZM1 RF |H|", f, _db(r, f))]
         for k in (1, 2, 3):
             v["marks"].append((k * fi, f"{k}f{i + 1}"))
             row(f"{k}f{i + 1}", k * fi, r)
-    elif point == "d" or point[0] == "g" or point in ("h", "i"):
+    elif t in ("d", "g"):
         r = comps.wdm
         offs = plan.offsets_GHz()
-        sel = range(len(offs)) if point == "d" else [i]
+        sel = range(len(offs)) if t == "d" else [i]
         lo, hi = min(offs) - 90, max(offs) + 90
-        if point != "d":
+        if t != "d":
             lo, hi = -90, 90
         x = np.linspace(lo, hi, 1200)
         v["xlabel"] = "Optical offset, GHz"
-        v["title"] = "MUX (all channels, shifted by WDM spacing)" if point == "d" else f"DEMUX, channel {i + 1}"
+        v["title"] = "MUX (all channels, shifted by WDM spacing)" if t == "d" else f"DEMUX, channel {i + 1}"
         for j in sel:
-            sh = offs[j] if point == "d" else 0.0
+            sh = offs[j] if t == "d" else 0.0
             v["curves"].append((f"ch{j + 1} WDM |H|", x, _db(r, x - sh)))
             fj = plan.f_lo_GHz[j]
             useful = useful_sidebands(plan, j)
@@ -92,15 +106,16 @@ def response_view(point, plan, sim, comps, fs, i):
                     v["marks"].append((sh + s * k, ("★" if is_u else "") + mk))
                     if s > 0:
                         row(f"ch{j + 1} ±{q}{' (useful)' if is_u else ''}", k, r)
-    elif point in ("m(t)", "e"):
+    elif t in ("m(t)", "e"):
         r = comps.mzm2_rf
         v["title"] = "MZM2 RF input"
         v["curves"] = [("MZM2 RF |H|", f, _db(r, f))]
-        v["band"] = (fc - bw / 2, fc + bw / 2)
-        for nm, fq in (("fc", fc), ("fc-edge", fc - bw / 2), ("fc+edge", fc + bw / 2)):
+        lo_, hi_ = plan.band_GHz(bw)
+        v["band"] = (lo_, hi_)
+        for nm, fq in (("fc", fc), ("fc-edge", lo_), ("fc+edge", hi_)):
             v["marks"].append((fq, nm))
             row(nm, fq, r)
-    elif point in ("k", "l", "m"):
+    elif t == "k":
         r = comps.pd
         v["title"] = f"Photodiode, channel {i + 1}"
         v["curves"] = [("PD |H|", f, _db(r, f))]
@@ -111,7 +126,7 @@ def response_view(point, plan, sim, comps, fs, i):
         f0, bwf = bpf_for(plan, sim, comps.bpf, i)
         x = np.linspace(max(f0 - 6 * bwf, 0.05), f0 + 6 * bwf, 1500)
         h = bpf_response(fs, plan, sim, comps.bpf, i, x)
-        v["title"] = f"BPF{'₁₂₃'[i]}: {f0:g} GHz / {bwf:g} GHz ({comps.bpf.kind}, order {comps.bpf.order})"
+        v["title"] = f"BPF{i + 1}: {f0:g} GHz / {bwf:g} GHz ({comps.bpf.kind}, order {comps.bpf.order})"
         v["curves"] = [("BPF |H|", x, 20 * np.log10(np.maximum(np.abs(h), 1e-6)))]
         v["gd"] = (x, group_delay_ns(fs, plan, sim, comps.bpf, i, x))
         v["band"] = (f0 - bwf / 2, f0 + bwf / 2)

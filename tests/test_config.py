@@ -51,6 +51,7 @@ def test_stage1_fields():
     assert "cn_min_dB" in d.sweeps and "fig10_budget_cn_dB" in r.sweeps
 
 
+@pytest.mark.slow
 def test_cli_fig10(tmp_path):
     r = subprocess.run([sys.executable, str(conftest.ROOT / "make_figures.py"), "--fig", "10", "--quick",
                         "--out", str(tmp_path)], capture_output=True, text=True, cwd=conftest.ROOT)
@@ -68,8 +69,58 @@ def test_stage2_fields():
     assert "fig11_sigma_pct" in d.sweeps and d.sweeps["n_cn_quick"] == 5
 
 
+@pytest.mark.slow
 def test_cli_fig11(tmp_path):
     r = subprocess.run([sys.executable, str(conftest.ROOT / "make_figures.py"), "--fig", "11", "--quick",
                         "--out", str(tmp_path)], capture_output=True, text=True, cwd=conftest.ROOT)
     assert r.returncode == 0, r.stderr
     assert (tmp_path / "fig11_bias_drift.png").exists()
+
+
+def test_router_and_scenarios():
+    from mwp_converter.params import quick, scenario_plans
+
+    c = load_config(CFG / "router.toml")
+    assert c.plan.K == 4 and c.plan.N == 4 and c.sim.Rs == 0.15
+    assert c.comps.bpf.kind == "ellip" and c.comps.bpf.order == 8 and c.comps.bpf.bw_GHz == 0.19 and c.sim.alpha == 0.2
+    assert set(scenario_plans(c)) == {"multicast", "subband", "inverted"}
+    assert quick(c).sim.n_sym == 2 ** 10 and quick(load_config(CFG / "default.toml")).sim.n_sym == 2 ** 11
+    assert load_config(CFG / "router_realistic.toml").imp.edfa
+    assert load_config(CFG / "default.toml").comps.bpf.stop_dB == 40.0
+
+
+def test_carrier_route_overrides():
+    c = load_config(CFG / "router.toml", dict(carriers=[29.8, 30.0], routes=[(1, 19.8), (2, 19.8)]))
+    assert c.plan.K == 2 and c.plan.f_lo_GHz == pytest.approx((5.0, 5.1))
+    c = load_config(CFG / "router.toml", dict(routes=[(1, 12.0), (4, 12.0, "lower", "high")]))
+    assert c.plan.out_freqs() == pytest.approx([12.0, 12.0]) and c.plan.line_info(1)[1] == "-"
+    c = load_config(CFG / "router.toml", dict(fc=14.0, flo=[8.0], direction="upper"))
+    assert c.plan.K == 1 and c.plan.out_freqs() == [30.0]
+
+
+@pytest.mark.slow
+def test_cli_fig12_two_carriers(tmp_path):
+    r = subprocess.run([sys.executable, str(conftest.ROOT / "make_figures.py"), "--config", "configs/router.toml",
+                        "--carriers", "29.8,30.0", "--routes", "1:19.8,2:19.8", "--fig", "12", "--quick",
+                        "--out", str(tmp_path)], capture_output=True, text=True, cwd=conftest.ROOT)
+    assert r.returncode == 0, r.stderr
+    assert (tmp_path / "fig12_routing.png").exists() and all(h in r.stdout for h in ("C/I,dB", "C/ACI,dB", "C/IMD,dB", "C/LO,dB", "NPR,dB"))
+
+
+def test_receiver_equalizer_fields():
+    assert load_config(CFG / "router.toml").sim.equalizer == "lms" and load_config(CFG / "router.toml").sim.eq_taps == 11
+    assert load_config(CFG / "default.toml").sim.equalizer == "none"
+
+
+@pytest.mark.slow
+def test_cli_fig13_and_all_single_carrier(tmp_path):
+    """K = 1 (default.toml): fig13 и --fig all --quick завершаются с кодом 0 (C/I и NPR пропускаются)."""
+    run = lambda *a: subprocess.run([sys.executable, str(conftest.ROOT / "make_figures.py"), "--config", "configs/default.toml",
+                                     *a, "--quick", "--out", str(tmp_path)], capture_output=True, text=True, cwd=conftest.ROOT)
+    r = run("--fig", "13")
+    assert r.returncode == 0, r.stderr
+    assert "need K >= 2" in r.stdout and (tmp_path / "fig13_drive_sweep.png").exists()
+    r = run("--fig", "all")
+    assert r.returncode == 0, r.stderr
+    for name in ("fig12_routing", "fig13_drive_sweep", "fig14_bpf_selectivity"):
+        assert (tmp_path / f"{name}.png").exists()

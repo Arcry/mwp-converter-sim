@@ -10,11 +10,11 @@ import numpy as np
 
 from .analytic import beta1_opt, line_freq_GHz, lines_null
 from .model import measure_lines, run_all, simulate
-from .params import Components, Impairments, Plan, load_config, resolve_sps, scenario_plans
+from .params import Components, Impairments, Plan, load_config, quick as quick_cfg, resolve_sps, scenario_plans
 from .response import band_report_for_output, worst_level
 from .budget import noise_budget
 from .bpf import apply_bpf, bpf_for, suppression_table
-from .signals import metrics, receive_line
+from .signals import carrier_weights, make_multicarrier_baseband, measure, metrics, receive_line
 from scipy.signal import hilbert
 from .spectra import optical_spectrum, rf_psd, rf_psd_abs
 
@@ -96,8 +96,7 @@ def _psd_axes(ax, res, fs, plan, i, sim, xmax=None, names=None, mask=True, **kw)
 
 def _rx(res, tx, fs, plan, sim, i, which=None):
     f, sb = plan.line_info(i, which)
-    rx, s_ref = receive_line(res.I, fs, f, sb, sim, tx)
-    return f, sb, metrics(rx, s_ref, sim.M, sim.rx_block)
+    return f, sb, measure(res.I, fs, f, sb, sim, tx, carrier=plan.routes[i].carrier)
 
 
 def _const(ax, m, title):
@@ -423,7 +422,7 @@ def fig8(cfg, quick):
             continue
         xs.append(f1)
         fouts.append(fo)
-        name = "2fi-fc" if plan.direction == "lower" else "2fi+fc"
+        name = "2fi-fc" if pl.routes[0].sideband == "lower" else "2fi+fc"
         for k, c in variants.items():
             data[k].append(measure_lines(0, pl, sim, c, [name])[name][1])
         lev.append(worst_level(band_report_for_output(pl, rcomps, sim.Rs, sim.alpha_eff, 1)))
@@ -442,14 +441,14 @@ def fig8(cfg, quick):
     ax[1].plot(xs, evm_i, "k-o", ms=3, label="ideal")
     ax[1].plot(xs, evm_r, "r-o", ms=3, label="realistic")
     edges = np.concatenate([[xs[0]], (xs[1:] + xs[:-1]) / 2, [xs[-1]]])
-    half = plan.fc_GHz / 2
+    half = plan.fc_of(0) / 2
     for a in ax:
         for j, l in enumerate(lev):
             if l != "ok":
                 a.axvspan(edges[j], edges[j + 1], color="gold" if l == "warn" else "tomato", alpha=0.2, lw=0)
         a.set_xlabel("LO frequency f_i, GHz")
         a.legend(fontsize=7)
-        if plan.direction == "lower" and xs.min() < half < xs.max():
+        if plan.routes[0].sideband == "lower" and xs.min() < half < xs.max():
             a.axvline(half, color="gray", ls="--", lw=1)
             a.text(half, a.get_ylim()[0], " output → 0 / inversion boundary", fontsize=7, rotation=90,
                    va="bottom", ha="right")
@@ -574,7 +573,7 @@ def drift_ensemble(cfg, sg, nens):
     на линиях |f1-fc| и выходной (beta1_eff учитывает |H_mzm1(f1)|; WDM аналитикой не учитывается).
     """
     from .analytic import bias_error_ratio
-    from .bpf import _band_power
+    from .spectra import band_power as _band_power
     from .response import effective_betas
 
     plan, sim, comps = cfg.plan, cfg.sim, cfg.comps
@@ -641,4 +640,306 @@ def fig11(cfg, quick):
     return [("fig11_bias_drift", fig)], rows
 
 
-FIGURES = {1: fig1, 2: fig2, 3: fig3, 4: fig4, 5: fig5, 6: fig6, 7: fig7, 8: fig8, 9: fig9, 10: fig10, 11: fig11}
+def fig12(cfg, quick):
+    from .interference import ci_runs, npr
+    from .spectra import rf_psd_abs
+
+    plan, sim, imp, comps = cfg.plan, cfg.sim, cfg.imp, cfg.comps
+    sps = resolve_sps(plan, sim)
+    mb = make_multicarrier_baseband(plan, sim, sps)
+    res = run_all(plan, sim, imp, comps, baseband=mb, keep_fields=False)
+    fs = res[0].fs
+    bwsig = (1 + sim.alpha_eff) * sim.Rs
+    fig = plt.figure(figsize=(14, 10), constrained_layout=True)
+    gs = fig.add_gridspec(2, 2)
+    # (a) вход: PSD драйва с масками несущих
+    ax = fig.add_subplot(gs[0, 0])
+    nper = min(16 * sps, len(res[0].meta["u2_in"]))
+    f, p = rf_psd_abs(res[0].meta["u2_in"], fs, nper)
+    lo, hi = plan.band_GHz(bwsig)
+    xr = (lo - 0.5, hi + 0.5)
+    _spec(ax, f, 10 * np.log10(p / p.max() + 1e-300), xr, label="input u2")
+    for k, c in enumerate(plan.carriers):
+        ax.axvspan(c.f_GHz - bwsig / 2, c.f_GHz + bwsig / 2, color=COLORS[k % 10], alpha=0.2,
+                   label=f"carrier {k + 1}: {c.f_GHz:g} GHz")
+    ax.set_ylim(-100, 5)
+    ax.set_xlabel("Frequency, GHz")
+    ax.set_ylabel("PSD, dB rel. max")
+    ax.set_title(f"(a) Input band: {plan.K} carriers, drive beta_m = {sim.beta_m:g}")
+    ax.legend(fontsize=7)
+    # (b) оптика ветки 1: боковые f_ck - f_1
+    ax = fig.add_subplot(gs[0, 1])
+    fo_, pg = res[0].fields["g"]
+    ctr = plan.fc_of(0) - plan.f_lo_GHz[0] if plan.K == 1 else plan.f_mid() - plan.f_lo_GHz[0]
+    _spec(ax, fo_, pg, (ctr - 1.5, ctr + 1.5), label="after DEMUX")
+    for k, c in enumerate(plan.carriers):
+        ax.axvline(c.f_GHz - plan.f_lo_GHz[0], color=COLORS[k % 10], ls=":", lw=1)
+    ax.set_ylim(-100, 5)
+    ax.set_xlabel("Optical offset, GHz")
+    ax.set_ylabel("Power, dB rel. max")
+    ax.set_title(f"(b) Optics of branch 1 near f_c - f_1 = {ctr:g} GHz (carrier sidebands)")
+    # (c) фототок: до и после BPF, зум у выхода
+    ax = fig.add_subplot(gs[1, 0])
+    fo = plan.line_info(0)[0]
+    df = (plan.carriers[1].f_GHz - plan.carriers[0].f_GHz) if plan.K > 1 else bwsig
+    xr = (fo - 3 * abs(df), fo + 3 * abs(df))
+    ref = None
+    Ibs = []
+    for i, r in enumerate(res):
+        Ib = apply_bpf(r.I, fs, plan, sim, comps.bpf, i)
+        Ibs.append(Ib)
+        fr, p0 = rf_psd_abs(r.I, fs, nper)
+        _, p1 = rf_psd_abs(Ib, fs, nper)
+        ref = ref or p0.max()
+        _spec(ax, fr, 10 * np.log10(p0 / ref + 1e-300), xr, color="lightgray")
+        _spec(ax, fr, 10 * np.log10(p1 / ref + 1e-300), xr, color=COLORS[i % 10], label=f"branch {i + 1} after BPF")
+    seen = {}
+    for name, fq in plan.spurs(0).items():
+        if xr[0] < fq < xr[1] and not name.endswith("@+"):
+            seen.setdefault(round(fq, 4), []).append("IM3" if name.startswith("im3(") else name)
+    for fq, names in seen.items():
+        ax.axvline(fq, color="gray", ls=":", lw=0.7)
+        ax.text(fq, 3, ", ".join(sorted(set(names))), fontsize=6, rotation=90, va="bottom")
+    ax.set_ylim(-100, 10)
+    ax.set_xlabel("Frequency, GHz")
+    ax.set_ylabel("PSD, dB rel. max before BPF")
+    ax.set_title(f"(c) Photocurrent at {fo:g} GHz: before (gray) / after BPF; marks: images and IM3 of branch 1",
+                 fontsize=9)
+    ax.legend(fontsize=6)
+    # (d) созвездия веток
+    sub = gs[1, 1].subgridspec(2, 2)
+    rows = []
+    lines = [f"{'br':>3}{'c':>3}{'f_i':>7}{'f_out':>7}{'EVM%':>7}{'EVM eq%':>8}{'BER':>9}{'C/I,dB':>8}{'C/ACI,dB':>10}{'C/IMD,dB':>10}{'C/LO,dB':>9}{'NPR,dB':>8}"]
+    for i, r in enumerate(res[:4]):
+        a = fig.add_subplot(sub[i // 2, i % 2])
+        k = plan.routes[i].carrier
+        f, sb = plan.line_info(i)
+        m = measure(Ibs[i], fs, f, sb, sim, mb, carrier=k)
+        if plan.K > 1:
+            ci = ci_runs(cfg, i)
+            npr_i = npr(cfg, i)
+            cis = (ci["ci_dB"], ci["ci_aci_dB"], ci["ci_imd_dB"], ci["ci_lo_dB"], npr_i)
+        else:
+            cis = (float("nan"),) * 5
+        _const(a, m, f"b{i + 1}: c{k + 1} {plan.carriers[k].f_GHz:g}→{f:g}, EVM {m['evm_pct']:.1f}%, C/I {cis[0]:.1f} dB")
+        _row(rows, "fig12", f"branch {i + 1}", f, m)
+        ee = m["evm_eq_pct"] if m["evm_eq_pct"] is not None else float("nan")
+        lines.append(f"{i + 1:3d}{k + 1:3d}{plan.f_lo_GHz[i]:7.2f}{f:7.2f}{m['evm_pct']:7.2f}{ee:8.2f}{m['ber_mc']:9.1e}"
+                     f"{cis[0]:8.1f}{cis[1]:10.1f}{cis[2]:10.1f}{cis[3]:9.1f}{cis[4]:8.1f}")
+    fig.suptitle(f"Carrier routing: {plan.K} carriers -> {plan.N} branches, Rs = {sim.Rs:g} GBd, fs = {fs / 1e9:g} GHz",
+                 fontsize=10)
+    return [("fig12_routing", fig)], rows, lines
+
+
+def _gd_ripple_ns(kind, order, f0, B, half, ripple=0.5, stop=40.0):
+    """Неравномерность группового запаздывания (p-p, нс) в полосе f0 ± half по аналоговому прототипу."""
+    from scipy import signal
+
+    f = np.linspace(f0 - half, f0 + half, 201)
+    om = (f ** 2 - f0 ** 2) / (f * B)
+    if kind == "butter":
+        b, a = signal.butter(order, 1.0, analog=True)
+    elif kind == "cheby1":
+        b, a = signal.cheby1(order, ripple, 1.0, analog=True)
+    else:
+        b, a = signal.ellip(order, ripple, stop, 1.0, analog=True)
+    _, h = signal.freqs(b, a, worN=np.abs(om))
+    ph = np.unwrap(np.sign(om) * np.angle(h))
+    tau = -np.gradient(ph, 2 * np.pi * f * 1e9)
+    return float(np.ptp(tau) * 1e9)
+
+
+def _beta_grid(sw, quick):
+    nb = sw.get("fig13_n_beta_quick", 5) if quick else sw.get("fig13_n_beta", 10)
+    return np.unique(np.round(np.geomspace(sw.get("fig13_beta_min", 0.1), sw.get("fig13_beta_max", 1.1), nb), 3))
+
+
+def fig13(cfg, quick):
+    from .analytic import ci_multitone
+    from .interference import drive_sweep
+
+    sw = cfg.sweeps
+    betas = _beta_grid(sw, quick)
+    plan, sim = cfg.plan, cfg.sim
+    if plan.K < 2:
+        return _fig13_single(cfg, betas)
+    i = 1 if plan.N > 1 else 0
+    real = load_config(CONFIG_DIR / sw.get("fig13_compare_config", "router_realistic.toml"))
+    if quick:
+        real = quick_cfg(real)
+    cmp_name = str(sw.get("fig13_compare_config", "router_realistic.toml")).removesuffix(".toml")
+    base_name = f"{cfg.name} (as configured)"
+    cases = [(base_name, cfg, True), (cmp_name, replace(real, plan=cfg.plan, sim=cfg.sim), False)]
+    res = {name: drive_sweep(c, i, betas, with_npr=with_npr) for name, c, with_npr in cases}
+    rows, lines = [], []
+    fig, ax = plt.subplots(1, 3, figsize=(17, 5))
+    r0, b0 = res[base_name]
+    bb = np.array([r["beta"] for r in r0])
+    ax[0].plot(bb, [r["cni_dB"] for r in r0], "o-", label="C/I (model)")
+    ax[0].plot(bb, [r["ci_aci_dB"] for r in r0], "s--", label="C/ACI")
+    ax[0].plot(bb, [r["ci_imd_dB"] for r in r0], "^--", label="C/IMD")
+    dense = np.geomspace(bb.min(), bb.max(), 100)
+    fcs = [c.f_GHz for c in plan.carriers]
+    a = carrier_weights(plan.carriers)          # уровни несущих (level_dB), как во входном композите
+    an = [ci_multitone(sim.beta1, list(b * a), plan.routes[i].carrier, fcs, plan.f_lo_GHz[i],
+                       plan.routes[i].sideband)["ci_dB"] for b in dense]
+    ax[0].plot(dense, an, "k:", label="tone analytic (ci_multitone)")
+    ax[0].set_xscale("log")
+    ax[0].set_xlabel("$\\beta_m$")
+    ax[0].set_ylabel("dB")
+    ax[0].legend(fontsize=7, loc="upper right")
+    ax[0].set_title(f"(a) Branch {i + 1}: C/I vs drive; EVM on right axis", fontsize=9)
+    a2 = ax[0].twinx()
+    a2.plot(bb, [r["evm_pct"] for r in r0], "r-o", ms=3, label="EVM, %")
+    if r0[0]["evm_eq_pct"] is not None:
+        a2.plot(bb, [r["evm_eq_pct"] for r in r0], "r--s", ms=3, label="EVM with equalizer, %")
+    a2.set_yscale("log")
+    a2.set_ylabel("EVM, %", color="r")
+    a2.legend(fontsize=7, loc="lower left")
+    _ibo_axis(ax[0])
+    for k, (name, (rr, bs)) in enumerate(res.items()):
+        ax[1].plot([r["beta"] for r in rr], [r["cni_dB"] for r in rr], "o-", color=COLORS[k], label=name)
+        ax[1].axvline(bs, color=COLORS[k], ls=":", lw=1)
+        ax[1].text(bs, ax[1].get_ylim()[0], f" $\\beta^*$={bs:g}", color=COLORS[k], fontsize=8, va="bottom")
+        lines.append(f"  {name}: beta* = {bs:g} (max C/(N+I) on grid {', '.join(f'{b:g}' for b in betas)})")
+    ax[1].set_xscale("log")
+    ax[1].set_xlabel("$\\beta_m$")
+    ax[1].set_ylabel("C/(N+I), dB")
+    ax[1].legend(fontsize=7)
+    ax[1].set_title("(b) C/(N+I) vs drive and optimum $\\beta^*$", fontsize=9)
+    ax[2].plot(bb, [r["npr_dB"] for r in r0], "o-")
+    ax[2].set_xscale("log")
+    ax[2].set_xlabel("$\\beta_m$")
+    ax[2].set_ylabel("NPR, dB")
+    ax[2].set_title("(c) NPR (noise loading with notch on the carrier)", fontsize=9)
+    fig.tight_layout()
+    lines = [f"{'beta':>6}{'EVM,%':>8}{'EVM eq,%':>9}{'C/(N+I)':>9}{'C/ACI':>8}{'C/IMD':>8}{'NPR':>7}"] + [
+        f"{r['beta']:6.3f}{r['evm_pct']:8.2f}{(r['evm_eq_pct'] if r['evm_eq_pct'] is not None else float('nan')):9.2f}"
+        f"{r['cni_dB']:9.1f}{r['ci_aci_dB']:8.1f}{r['ci_imd_dB']:8.1f}{r['npr_dB']:7.1f}" for r in r0] + lines
+    return [("fig13_drive_sweep", fig)], rows, lines
+
+
+def _ibo_axis(ax):
+    """Верхняя ось IBO (ориентир 20 lg((pi/2)/beta_m)) для оси beta_m в логарифмическом масштабе."""
+    top = ax.twiny()
+    top.set_xscale("log")
+    top.set_xlim(ax.get_xlim())
+    ticks = [t for t in (0.1, 0.2, 0.5, 1.0) if ax.get_xlim()[0] <= t <= ax.get_xlim()[1]]
+    top.set_xticks(ticks)
+    top.set_xticklabels([f"{20 * np.log10((np.pi / 2) / t):.0f}" for t in ticks])
+    top.minorticks_off()
+    top.set_xlabel("IBO, dB (ref.: 20 lg((pi/2)/beta_m))", fontsize=8)
+
+
+def _fig13_single(cfg, betas):
+    """fig13 при K = 1: C/I, ACI/IMD и NPR не определены (нужны >= 2 несущих), показан EVM против drive."""
+    sim = cfg.sim
+    ev, eq, rows = [], [], []
+    for b in betas:
+        c = replace(cfg, sim=replace(sim, beta_m=float(b)))
+        res, tx, fs = simulate(c.plan, c.sim, c.imp, c.comps, 0)
+        f, sb, m = _rx(res, tx, fs, c.plan, c.sim, 0)
+        ev.append(m["evm_pct"])
+        eq.append(m["evm_eq_pct"])
+        _row(rows, "fig13", f"beta_m={b:g}", f, m)
+    fig, ax = plt.subplots(1, 3, figsize=(17, 5))
+    for a_ in (ax[0], ax[2]):
+        a_.text(0.5, 0.5, "needs K ≥ 2 carriers\n(C/I, ACI/IMD, NPR are not defined for K = 1)", ha="center",
+                va="center", transform=a_.transAxes)
+        a_.set_xticks([])
+        a_.set_yticks([])
+    ax[0].set_title("(a) C/I, C/ACI, C/IMD vs drive: needs K ≥ 2", fontsize=9)
+    ax[2].set_title("(c) NPR: needs K ≥ 2", fontsize=9)
+    ax[1].plot(betas, ev, "ro-", label="EVM")
+    if eq[0] is not None:
+        ax[1].plot(betas, eq, "rs--", label="EVM with equalizer")
+    ax[1].set_xscale("log")
+    ax[1].set_yscale("log")
+    ax[1].set_xlabel("$\\beta_m$")
+    ax[1].set_ylabel("EVM, %")
+    ax[1].legend(fontsize=7)
+    ax[1].set_title("(b) K = 1: EVM vs drive", fontsize=9)
+    fig.tight_layout()
+    lines = ["fig13: K = 1 — C/I, ACI/IMD and NPR skipped (need K >= 2); EVM vs beta_m:"] + [
+        f"  beta_m={b:6.3f}  EVM={e:6.2f} %" for b, e in zip(betas, ev)]
+    return [("fig13_drive_sweep", fig)], rows, lines
+
+
+def fig14(cfg, quick):
+    from .response import bpf_att_dB, bpf_band
+
+    plan, sim, comps = cfg.plan, cfg.sim, cfg.comps
+    sw = cfg.sweeps
+    f0, B = bpf_band(plan, sim.Rs, sim.alpha_eff, comps.bpf, 0)
+    rs = sim.Rs
+    spacing = (abs(plan.carriers[1].f_GHz - plan.carriers[0].f_GHz) if plan.K > 1
+               else sw.get("fig14_spacing_Rs", 1.33) * rs)       # шаг несущих; при K = 1 — из [sweeps]
+    areq = sw.get("fig14_A_req_dB", 30.0)
+    rp0, st0 = comps.bpf.ripple_dB, comps.bpf.stop_dB
+    variants = [(v["kind"], int(v["order"]), v.get("ripple_dB", rp0), v.get("stop_dB", st0))
+                for v in sw.get("fig14_filters", [dict(kind="butter", order=4), dict(kind="butter", order=8),
+                                                  dict(kind="cheby1", order=6), dict(kind="ellip", order=6),
+                                                  dict(kind="ellip", order=8)])]
+    fig, ax = plt.subplots(1, 3, figsize=(17, 5))
+    x = np.linspace(sw.get("fig14_dfrs_min", 0.5), sw.get("fig14_dfrs_max", 3.0), 100)
+    for k, (kind, n, rp, st) in enumerate(variants):
+        att = [bpf_att_dB(f0 + d * rs, f0, B, n, kind, rp, st) for d in x]
+        ax[0].plot(x, att, color=COLORS[k], label=f"{kind} {n}")
+    ax[0].axhline(areq, color="k", ls=":", label=f"$A_{{req}}$ = {areq:g} dB")
+    ax[0].axvline(spacing / rs, color="gray", ls="--", lw=1)
+    ax[0].set_ylim(0, 80)
+    ax[0].set_xlabel("$\\Delta f / R_s$")
+    ax[0].set_ylabel("Neighbour suppression, dB")
+    ax[0].set_title(f"(a) Suppression at f0 ± Δf (B = {B:g} GHz, f0 = {f0:g} GHz; dashed: carrier spacing)", fontsize=9)
+    ax[0].legend(fontsize=7)
+    fo = np.linspace(sw.get("fig14_fo_min_GHz", 5.0), sw.get("fig14_fo_max_GHz", 40.0), int(sw.get("fig14_n_fo", 36)))
+    for k, (kind, n, rp, st) in enumerate(variants):
+        q = []
+        for f in fo:
+            lo, hi = 0.005, 5.0
+            for _ in range(40):                     # максимальная B, при которой подавление >= A_req
+                mid = (lo + hi) / 2
+                ok = bpf_att_dB(f + spacing, f, mid, n, kind, rp, st) >= areq
+                lo, hi = (mid, hi) if ok else (lo, mid)
+            q.append(f / lo)
+        ax[1].plot(fo, q, color=COLORS[k], label=f"{kind} {n}")
+    ax[1].set_yscale("log")
+    ax[1].set_xlabel("$f_{out}$, GHz")
+    ax[1].set_ylabel(f"Required Q = $f_{{out}}$/B ({areq:g} dB at the neighbour)")
+    ax[1].set_title(f"(b) Required Q vs output frequency (spacing {spacing:g} GHz)", fontsize=9)
+    ax[1].legend(fontsize=7)
+    half = (1 + sim.alpha_eff) * rs / 2
+    orders = sw.get("fig14_gd_orders", [6, 8])
+    bws = B * np.array(sw.get("fig14_c_bw_factors", [1.0, 1.6, 2.6]))
+    bg = np.linspace(B, 3 * B, 20)
+    for k, n in enumerate(orders):
+        ax[2].plot(bg, [_gd_ripple_ns("ellip", n, f0, b, half, rp0, st0) for b in bg], color=COLORS[k],
+                   label=f"GD ripple, ellip {n}")
+    ax[2].set_xlabel("BPF bandwidth B, GHz")
+    ax[2].set_ylabel("Group-delay ripple in $(1+\\alpha)R_s$, ns")
+    a2 = ax[2].twinx()
+    rows, ev, eq = [], [], []
+    c_order, c_beta = int(sw.get("fig14_c_order", 8)), sw.get("fig14_c_beta_m", 0.1)
+    for b in bws:
+        cc = replace(cfg, sim=replace(sim, equalizer="lms", beta_m=c_beta),   # малый beta_m: без нелинейности, чистая ISI
+                     comps=replace(comps, bpf=replace(comps.bpf, kind="ellip", order=c_order, bw_GHz=float(b))))
+        res, tx, fs = simulate(cc.plan, cc.sim, cc.imp, cc.comps, 0)
+        Ib = apply_bpf(res.I, fs, cc.plan, cc.sim, cc.comps.bpf, 0)
+        f, sb = cc.plan.line_info(0)
+        m = measure(Ib, fs, f, sb, cc.sim, tx, carrier=cc.plan.routes[0].carrier)
+        ev.append(m["evm_pct"])
+        eq.append(m["evm_eq_pct"])
+        _row(rows, "fig14c", f"ellip {c_order}, B={b:.2f} (no eq)", f, m)
+        rows.append(("fig14c", f"ellip {c_order}, B={b:.2f} (equalizer)", f, m["evm_eq_pct"], m["ber_eq"], 0, 0.0))
+    a2.plot(bws, ev, "ks", label="EVM without equalizer")
+    a2.plot(bws, eq, "k^", mfc="none", label="EVM with equalizer")
+    a2.set_ylabel("EVM, %")
+    h1, l1 = ax[2].get_legend_handles_labels()
+    h2, l2 = a2.get_legend_handles_labels()
+    ax[2].legend(h1 + h2, l1 + l2, fontsize=7)
+    ax[2].set_title(f"(c) Group-delay ripple (analog prototype) and EVM at beta_m = {c_beta:g}, branch 1", fontsize=9)
+    fig.tight_layout()
+    return [("fig14_bpf_selectivity", fig)], rows
+
+
+FIGURES = {1: fig1, 2: fig2, 3: fig3, 4: fig4, 5: fig5, 6: fig6, 7: fig7, 8: fig8, 9: fig9, 10: fig10, 11: fig11, 12: fig12, 13: fig13, 14: fig14}

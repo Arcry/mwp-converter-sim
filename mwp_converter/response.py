@@ -71,11 +71,63 @@ class Response:
 
 
 @dataclass
+class OpticalFilter:
+    """Оптический фильтр перед ФД (после DEMUX) с несимметричной АЧХ: H = sum_p h_p(f - c_p).
+
+    kind: none | lorentz | supergauss. fwhm_GHz — ширина полосы пропускания (по -3 дБ по мощности),
+    order — порядок supergauss. passbands: 'auto' (для lower — {+f_i, f_ck - f_i}, для upper —
+    {+f_i, -(f_i + f_ck)}: линия гетеродина и выбранная боковая) или кортеж отстроек, ГГц.
+    FSR не моделируется. lorentz: h = 1/(1 + 2j(f-c)/FWHM); supergauss: h = exp(-ln2/2 (2(f-c)/FWHM)^(2n)).
+    """
+
+    kind: str = "none"
+    fwhm_GHz: float = 1.0
+    order: int = 2
+    passbands: object = "auto"
+
+    @property
+    def is_none(self):
+        return self.kind == "none"
+
+    def centers(self, plan, i):
+        """Центры полос пропускания ветки i, ГГц (оптическая отстройка)."""
+        if self.passbands != "auto":
+            return tuple(float(c) for c in self.passbands)
+        fi, fc = plan.f_lo_GHz[i], plan.fc_of(i)
+        if plan.routes[i].sideband == "lower":
+            return (fi, fc - fi)
+        return (fi, -(fi + fc))
+
+    def H(self, f_Hz, centers_GHz):
+        """Комплексная АЧХ на частотах f_Hz (знак важен)."""
+        f = np.asarray(f_Hz, float) / 1e9
+        out = np.zeros(f.shape, complex)
+        for c in centers_GHz:
+            d = f - c
+            if self.kind == "lorentz":
+                out += 1.0 / (1 + 2j * d / self.fwhm_GHz)
+            elif self.kind == "supergauss":
+                out += np.exp(-np.log(2) / 2 * (2 * d / self.fwhm_GHz) ** (2 * self.order))
+            else:
+                raise ValueError(self.kind)
+        return out
+
+
+def apply_ofilt(E, fs, of, centers):
+    """Оптический фильтр к комплексной огибающей поля (БПФ по знаковой отстройке)."""
+    if of is None or of.is_none:
+        return E
+    f = np.fft.fftfreq(len(E), 1 / fs)
+    return np.fft.ifft(np.fft.fft(E) * of.H(f, centers))
+
+
+@dataclass
 class Bpf:
     """Выходной полосовой фильтр канала (перед усилителем).
 
-    kind: butter | cheby1 (ripple_dB). order — порядок прототипа (4). Ширина полосы:
-    bw_GHz, а если не задана — bw_factor*(1+alpha_eff)*Rs. center: по одному элементу на канал
+    kind: butter | cheby1 (ripple_dB) | ellip (ripple_dB, stop_dB). order — порядок прототипа (4).
+    Ширина полосы: bw_GHz (число или список по веткам), а если не задана —
+    bw_factor*(1+alpha_eff)*Rs. center: по одному элементу на канал
     ('auto' — центр следует за выходной линией, либо число, ГГц); если элементов меньше, чем
     каналов, используется последний.
     """
@@ -83,8 +135,9 @@ class Bpf:
     kind: str = "butter"
     order: int = 4
     bw_factor: float = 2.0
-    bw_GHz: float | None = None
+    bw_GHz: float | tuple | None = None
     ripple_dB: float = 1.0
+    stop_dB: float = 40.0
     center: tuple = ("auto",)
 
 
@@ -92,14 +145,35 @@ def bpf_band(plan, rs_GHz, alpha_eff, bpf, i):
     """(центр, полоса) BPF канала i, ГГц."""
     c = bpf.center[min(i, len(bpf.center) - 1)]
     f0 = plan.line_info(i)[0] if c == "auto" else float(c)
-    bw = bpf.bw_GHz if bpf.bw_GHz else bpf.bw_factor * (1 + alpha_eff) * rs_GHz
+    if isinstance(bpf.bw_GHz, (tuple, list)):
+        bw = float(bpf.bw_GHz[min(i, len(bpf.bw_GHz) - 1)])
+    elif bpf.bw_GHz:
+        bw = float(bpf.bw_GHz)
+    else:
+        bw = bpf.bw_factor * (1 + alpha_eff) * rs_GHz
     return f0, bw
 
 
-def bpf_att_dB(f, f0, bw, order):
-    """Оценка ослабления Баттерворта (полосовое преобразование), дБ; -3 дБ на краях полосы."""
-    x = (f * f - f0 * f0) / (max(f, 1e-9) * bw)
-    return float(10 * np.log10(1 + x ** (2 * order)))
+def bpf_att_dB(f, f0, bw, order, kind="butter", ripple_dB=1.0, stop_dB=40.0):
+    """Ослабление полосового фильтра по аналоговому прототипу, дБ (положительное).
+
+    Полосовое преобразование Omega = (f^2 - f0^2)/(f*bw); для butter — аналитически (-3 дБ на
+    краях полосы), для cheby1 и ellip — по `scipy.signal.freqs` аналогового прототипа с краем
+    полосы пропускания 1.
+    """
+    x = abs((f * f - f0 * f0) / (max(f, 1e-9) * bw))
+    if kind == "butter":
+        return float(10 * np.log10(1 + x ** (2 * order)))
+    from scipy import signal
+
+    if kind == "cheby1":
+        b, a = signal.cheby1(order, ripple_dB, 1.0, analog=True)
+    elif kind == "ellip":
+        b, a = signal.ellip(order, ripple_dB, stop_dB, 1.0, analog=True)
+    else:
+        raise ValueError(kind)
+    _, h = signal.freqs(b, a, worN=[x])
+    return float(-20 * np.log10(max(abs(h[0]), 1e-12)))
 
 
 def apply(x, fs, response):
@@ -137,8 +211,8 @@ def band_report(plan, comps, rs_GHz=1.0, alpha=0.35, imp=None):
     plan.check() (component="plan") о паразитных линиях у выхода.
     """
     rep = []
-    fc = plan.fc_GHz
     bw = (1 + alpha) * rs_GHz
+    band_lo, band_hi = plan.band_GHz(bw)
 
     def add(comp, ch, line, f, resp, passes=1):
         a = _att(resp, f * 1e9, passes)
@@ -146,10 +220,11 @@ def band_report(plan, comps, rs_GHz=1.0, alpha=0.35, imp=None):
                         att_dB=a, level=level_of(a)))
 
     for i, fi in enumerate(plan.f_lo_GHz):
+        fc = plan.fc_of(i)
         add("mzm1_rf", i + 1, "fi", fi, comps.mzm1_rf)
         add("mzm2_rf", i + 1, "fc", fc, comps.mzm2_rf)
-        add("mzm2_rf", i + 1, "fc-edge", fc - bw / 2, comps.mzm2_rf)
-        add("mzm2_rf", i + 1, "fc+edge", fc + bw / 2, comps.mzm2_rf)
+        add("mzm2_rf", i + 1, "fc-edge", band_lo, comps.mzm2_rf)
+        add("mzm2_rf", i + 1, "fc+edge", band_hi, comps.mzm2_rf)
         for name, f in (("2fi+fc", 2 * fi + fc), ("2fi-fc", 2 * fi - fc), ("fc", fc), ("3fc", 3 * fc)):
             add("pd", i + 1, name, f, comps.pd)
         for name, f in (("fi", fi), ("fi+fc", fi + fc), ("fi-fc", fi - fc), ("3fi", 3 * fi)):
@@ -166,23 +241,38 @@ def band_report(plan, comps, rs_GHz=1.0, alpha=0.35, imp=None):
     if imp is not None and getattr(imp, "edfa", False) and getattr(imp, "edfa_ase", True) and comps.wdm.is_ideal:
         rep.append(dict(component="edfa", channel=0, line="ASE", f_GHz=0.0, att_dB=0.0, level="warn",
                         msg="EDFA ASE is not filtered: WDM is ideal (full-band ASE reaches the photodiode)"))
-    chk = plan.check(rs_GHz, alpha)
+    if not comps.ofilt.is_none:
+        for i in range(plan.N):
+            for c in comps.ofilt.centers(plan, i):
+                a = float(-20 * np.log10(max(abs(comps.ofilt.H([c * 1e9], comps.ofilt.centers(plan, i))[0]), 1e-12)))
+                rep.append(dict(component="ofilt", channel=i + 1, line="passband", f_GHz=float(abs(c)),
+                                att_dB=a, level=level_of(a)))
+            for j, cj in enumerate(plan.carriers):
+                if j != plan.routes[i].carrier:
+                    off = cj.f_GHz - plan.f_lo_GHz[i] if plan.routes[i].sideband == "lower" else -(cj.f_GHz + plan.f_lo_GHz[i])
+                    a = float(-20 * np.log10(max(abs(comps.ofilt.H([off * 1e9], comps.ofilt.centers(plan, i))[0]), 1e-12)))
+                    rep.append(dict(component="ofilt", channel=i + 1, line=f"img(c{j + 1}) sideband",
+                                    f_GHz=float(abs(off)), att_dB=a, level="ok"))
+    chk = plan.check(rs_GHz, alpha, comps.bpf)
     rep += chk
     flagged = {(r["channel"], r["line"]) for r in chk}
+    flagged |= {(r["channel"], n) for r in chk for n in r.get("lines", ())}
     for i in range(len(plan.f_lo_GHz)):
         f0, bw = bpf_band(plan, rs_GHz, alpha, comps.bpf, i)
         fo = plan.line_info(i)[0]
         inside = abs(fo - f0) <= bw / 2 + 1e-9
-        att = bpf_att_dB(fo, f0, bw, comps.bpf.order)
+        att = bpf_att_dB(fo, f0, bw, comps.bpf.order, comps.bpf.kind, comps.bpf.ripple_dB, comps.bpf.stop_dB)
         rep.append(dict(component="bpf", channel=i + 1, line="output line", f_GHz=float(fo), att_dB=att,
                         level="ok" if inside else "out",
                         **({} if inside else dict(msg=f"channel {i + 1}: output line {fo:g} GHz outside "
                                                       f"BPF {f0:g}±{bw / 2:g} GHz"))))
         for name, f in plan.spurs(i).items():
             if abs(f - f0) <= bw / 2 and (i + 1, name) not in flagged and abs(f - fo) > 1e-9:
+                kind_ = "ACI: neighbour image" if name.startswith("img(") else "spurious"
                 rep.append(dict(component="bpf", channel=i + 1, line=name, f_GHz=float(f), att_dB=0.0,
-                                level="out", msg=f"channel {i + 1}: spurious {name} = {f:g} GHz inside "
-                                                 f"BPF {f0:g}±{bw / 2:g} GHz"))
+                                level="warn" if name.startswith("img(") else "out",
+                                msg=f"channel {i + 1}: {kind_} {name} = {f:g} GHz inside "
+                                    f"BPF {f0:g}±{bw / 2:g} GHz"))
     return rep
 
 
@@ -194,16 +284,17 @@ def band_report_for_output(plan, comps, rs_GHz=1.0, alpha=0.35, channel=None, im
     upper (2f_i+f_c) — ±f_i и ±(f_i+f_c); записи plan.check() (совпадения с выходом).
     channel — номер канала с 1 (None — все каналы).
     """
-    out_line = "2fi-fc" if plan.direction == "lower" else "2fi+fc"
-    keep = {"mzm1_rf": ("fi",), "mzm2_rf": ("fc", "fc-edge", "fc+edge"), "pd": (out_line,),
-            "wdm": ("optical fi",
-                    "optical fi-fc" if plan.direction == "lower" else "optical fi+fc"), "plan": None, "bpf": None}
     rep = []
     for r in band_report(plan, comps, rs_GHz, alpha, imp):
         if r["component"] == "edfa":
             continue
         if channel is not None and r["channel"] != channel:
             continue
+        low = plan.routes[max(r["channel"] - 1, 0)].sideband == "lower"     # боковая именно этой ветки
+        keep = {"mzm1_rf": ("fi",), "mzm2_rf": ("fc", "fc-edge", "fc+edge"),
+                "pd": ("2fi-fc" if low else "2fi+fc",),
+                "wdm": ("optical fi", "optical fi-fc" if low else "optical fi+fc"),
+                "plan": None, "bpf": None, "ofilt": None}
         lines = keep.get(r["component"], ())
         if lines is None or r["line"].replace(" [MUX+DEMUX]", "") in lines:
             rep.append(r)
@@ -218,7 +309,7 @@ def worst_level(rep):
 
 def effective_betas(plan, comps, beta1, beta_m):
     """Эффективные (beta1*|H_mzm1(fi)|, beta_m*|H_mzm2(fc)|) для каждого канала."""
-    hm = np.abs(comps.mzm2_rf.H(np.array([plan.fc_GHz * 1e9])))[0]
+    hm = np.abs(comps.mzm2_rf.H(np.array([plan.f_mid() * 1e9])))[0]
     out = []
     for fi in plan.f_lo_GHz:
         h1 = np.abs(comps.mzm1_rf.H(np.array([fi * 1e9])))[0]

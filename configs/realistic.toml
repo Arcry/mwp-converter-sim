@@ -74,6 +74,8 @@ tau_s = 1.0
 
 [receiver]
 block_symbols = 256       # поблочная подстройка фазы (0 — выключена)
+equalizer = "none"         # none | lms: T/2-эквалайзер приёмника (data-aided, МНК), считается рядом с EVM без него
+eq_taps = 11
 
 [components.mzm1_rf]
 kind = "skin"
@@ -98,10 +100,34 @@ isolation_dB = 25.0
 kind = "butter"            # butter | cheby1
 order = 4
 bw_factor = 2.0            # ширина = bw_factor*(1+alpha)*Rs, если bw_GHz не задана
-ripple_dB = 1.0            # для cheby1
+ripple_dB = 1.0            # для cheby1 и ellip
+stop_dB = 40.0             # подавление в полосе заграждения (ellip)
 center = "auto"            # "auto" (следует за выходной линией), число ГГц или список по каналам
 
+[components.ofilt]         # оптический фильтр перед ФД (этап 2 маршрутизации; заглушка)
+kind = "none"
+
 [sweeps]
+fig13_compare_config = "router_realistic.toml"   # второй конфиг для fig13(b)
+fig14_A_req_dB = 30.0
+fig14_spacing_Rs = 1.33            # разнос Δf/R_s для K = 1 (при K > 1 берётся шаг несущих)
+fig14_dfrs_min = 0.5
+fig14_dfrs_max = 3.0
+fig14_fo_min_GHz = 5.0
+fig14_fo_max_GHz = 40.0
+fig14_n_fo = 36
+fig14_filters = [
+  {kind = "butter", order = 4}, {kind = "butter", order = 8}, {kind = "cheby1", order = 6},
+  {kind = "ellip", order = 6}, {kind = "ellip", order = 8},
+]
+fig14_gd_orders = [6, 8]
+fig14_c_bw_factors = [1.0, 1.6, 2.6]
+fig14_c_order = 8
+fig14_c_beta_m = 0.1
+fig13_beta_min = 0.1
+fig13_beta_max = 1.1
+fig13_n_beta = 10
+fig13_n_beta_quick = 5
 fig4_flo_GHz = 9.0
 beta1_min = 0.1
 beta1_max = 3.0
