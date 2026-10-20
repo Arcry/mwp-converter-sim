@@ -18,20 +18,25 @@ def main():
     ap.add_argument("--fc", type=float)
     ap.add_argument("--flo", type=lambda s: [float(v) for v in s.split(",")])
     ap.add_argument("--direction", choices=["lower", "upper"])
+    ap.add_argument("--carriers", type=lambda s: [float(v) for v in s.split(",")],
+                    help="несущие входной полосы, ГГц: 29.6,29.8,30.0")
+    ap.add_argument("--routes", type=lambda s: [(int(r.split(":")[0]), float(r.split(":")[1]))
+                                                + tuple(r.split(":")[2:]) for r in s.split(",")],
+                    help="маршруты k:f_out[:sideband[:lo]] (k с 1), например 1:19.8,2:19.8")
     ap.add_argument("--rs", type=float)
     ap.add_argument("--beta1", type=float)
     ap.add_argument("--beta-m", type=float, dest="beta_m")
-    ap.add_argument("--fig", default="all", help="all или номер 1..11")
+    ap.add_argument("--fig", default="all", help="all или номер 1..14")
     ap.add_argument("--quick", action="store_true")
     ap.add_argument("--out", default="figures/")
     a = ap.parse_args()
     cfg = load_config(a.config, dict(fc=a.fc, flo=a.flo, direction=a.direction, rs=a.rs,
-                                     beta1=a.beta1, beta_m=a.beta_m))
+                                     beta1=a.beta1, beta_m=a.beta_m, carriers=a.carriers, routes=a.routes))
     if a.quick:
         cfg = to_quick(cfg)
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
-    print(f"config={cfg.name}  quick={a.quick}  fc={cfg.plan.fc_GHz:g} GHz  f_lo={cfg.plan.f_lo_GHz}  "
+    print(f"config={cfg.name}  quick={a.quick}  fc={', '.join(f'{c.f_GHz:g}' for c in cfg.plan.carriers)} GHz  f_lo={cfg.plan.f_lo_GHz}  "
           f"direction={cfg.plan.direction}  outputs={[round(f, 3) for f in cfg.plan.out_freqs()]}")
     print(f"fs = {fs_GHz(cfg.plan, cfg.sim):g} GHz (SpS auto), n_sym = {cfg.sim.n_sym}")
     rep = band_report(cfg.plan, cfg.comps, cfg.sim.Rs, cfg.sim.alpha_eff, cfg.imp)

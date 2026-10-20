@@ -19,6 +19,12 @@ def rf_psd_abs(x, fs, nperseg=2 ** 13):
     return f / 1e9, p
 
 
+def band_power(f, p, f0, bw):
+    """Мощность (сумма PSD по бинам) в окне f0 ± bw/2; f, f0, bw — в ГГц."""
+    m = np.abs(f - f0) <= bw / 2
+    return float(p[m].sum()) if m.any() else 1e-300
+
+
 def coherent_length(fs, freqs_GHz, n_target, nmax=2 ** 20):
     """Длина записи N ~ n_target, при которой все частоты попадают точно в бины.
 

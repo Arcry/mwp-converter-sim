@@ -5,14 +5,13 @@ import numpy as np
 
 from .model import simulate
 from .params import Impairments
-from .signals import metrics, receive_line
+from .signals import measure
 
 
 def _snr(plan, sim, imp, comps, i):
     res, tx, fs = simulate(plan, sim, imp, comps, i)
     f, sb = plan.line_info(i)
-    rx, s_ref = receive_line(res.I, fs, f, sb, sim, tx)
-    m = metrics(rx, s_ref, sim.M, sim.rx_block)
+    m = measure(res.I, fs, f, sb, sim, tx, carrier=plan.routes[i].carrier)
     return m["evm_pct"], m["snr_evm_dB"]
 
 

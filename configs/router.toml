@@ -1,0 +1,172 @@
+# Маршрутизатор несущих: идеальная модель
+# Идеальная модель: полосы компонентов не ограничены, шумы выключены.
+# Единственное место с частотами по умолчанию. Частоты в ГГц.
+
+[plan]
+wdm_spacing_GHz = 100.0
+# Многонесущий вход: 4 несущие QPSK, все переносятся на 19.8 ГГц (повторное использование частоты).
+# carriers: f_GHz, level_dB, M, seed_offset. routes: carrier (с 1), f_out_GHz, sideband (lower|upper),
+# lo (low|high; для lower) либо готовый f_lo_GHz.
+carriers = [
+  {f_GHz = 29.6}, {f_GHz = 29.8}, {f_GHz = 30.0}, {f_GHz = 30.2},
+]
+routes = [
+  {carrier = 1, f_out_GHz = 19.8}, {carrier = 2, f_out_GHz = 19.8},
+  {carrier = 3, f_out_GHz = 19.8}, {carrier = 4, f_out_GHz = 19.8},
+]
+
+[signal]
+Rs_GBd = 0.15
+alpha = 0.2
+n_sym = 4096
+M = 4
+seed = 1
+SpS = "auto"
+pulse = "rrc"              # rrc | rect
+
+[modulators]
+beta1 = 1.0
+beta_m = 0.5
+Vpi = 2.0
+bias_err = 0.0           # уход смещения MZM1, доля Vpi
+er_enabled = false
+er_dB = 30.0
+
+[laser]
+noise = false
+P_dBm = 10.0
+rin_dBHz = -150.0
+linewidth_Hz = 1.0e6
+
+[pd]
+noise = false
+R = 0.7
+RL = 50.0
+T_C = 25.0
+amp_nf_dB = 0.0      # усилитель после ФД (0 — выключен)
+
+[losses]                  # вносимые потери, дБ
+mzm1_dB = 0.0
+mux_dB = 0.0
+mzm2_dB = 0.0
+demux_dB = 0.0
+
+[input]                   # шум на входе: C/N на входе LNA в полосе Rs, каскад по Фриису
+noise = false
+cn_dB = 20.0
+nf_lna_dB = 2.0
+g_lna_dB = 30.0
+nf_driver_dB = 8.0
+bw_factor = 2.0           # срез входного BPF = bw_factor*(1+alpha)*Rs/2
+
+[edfa]                    # один EDFA после МЦМ2, до DEMUX
+enabled = false
+G_dB = 16.0
+NF_dB = 5.0
+lambda_nm = 1550.0
+
+[lo]                      # фазовый шум гетеродина
+phase_noise = false
+profile = "synth_typical"  # synth_typical | dvbs2_mask | table (тогда table = [[f_Hz, dBc/Hz], ...])
+
+[drivers]                 # нелинейность драйверов: полином через OIP3 и HD2
+nonlinear = false
+oip3_dBm = 33.0
+hd2_lo_dBc = -30.0
+hd2_sig_dBc = -40.0
+
+[bias_drift]              # дрейф смещения МЦМ1 (процесс Орнштейна-Уленбека)
+enabled = false
+sigma_pct = 2.0
+tau_s = 1.0
+
+[receiver]
+block_symbols = 256       # поблочная подстройка фазы (0 — выключена)
+equalizer = "lms"         # none | lms: T/2-эквалайзер приёмника (data-aided, МНК), считается рядом с EVM без него
+eq_taps = 11
+
+[components.mzm1_rf]
+kind = "ideal"
+
+[components.mzm2_rf]
+kind = "ideal"
+
+[components.pd]
+kind = "ideal"
+
+[components.wdm]
+kind = "ideal"
+f3dB_GHz = 80.0
+order = 2
+isolation_dB = 25.0
+
+[components.bpf]
+kind = "ellip"             # butter | cheby1 | ellip
+order = 8
+bw_GHz = 0.19              # число или список по веткам; иначе bw_factor*(1+alpha)*Rs
+ripple_dB = 0.5
+stop_dB = 40.0
+center = "auto"
+
+[sweeps]
+fig13_compare_config = "router_realistic.toml"   # второй конфиг для fig13(b)
+fig14_A_req_dB = 30.0
+fig14_spacing_Rs = 1.33            # разнос Δf/R_s для K = 1 (при K > 1 берётся шаг несущих)
+fig14_dfrs_min = 0.5
+fig14_dfrs_max = 3.0
+fig14_fo_min_GHz = 5.0
+fig14_fo_max_GHz = 40.0
+fig14_n_fo = 36
+fig14_filters = [
+  {kind = "butter", order = 4}, {kind = "butter", order = 8}, {kind = "cheby1", order = 6},
+  {kind = "ellip", order = 6}, {kind = "ellip", order = 8},
+]
+fig14_gd_orders = [6, 8]
+fig14_c_bw_factors = [1.0, 1.6, 2.6]
+fig14_c_order = 8
+fig14_c_beta_m = 0.1
+fig13_beta_min = 0.1
+fig13_beta_max = 1.1
+fig13_n_beta = 10
+fig13_n_beta_quick = 5
+fig4_flo_GHz = 9.0
+beta1_min = 0.1
+beta1_max = 3.0
+beta_m_min = 0.05
+beta_m_max = 1.5
+n_beta = 30
+n_beta_quick = 8
+n_evm = 15
+n_evm_quick = 6
+rx_dBm_min = -38.0
+rx_dBm_max = -8.0
+n_rx = 11
+n_rx_quick = 5
+cn_min_dB = 5.0
+cn_max_dB = 35.0
+n_cn = 7
+n_cn_quick = 5
+fig10_budget_cn_dB = 20.0
+fig11_sigma_pct = [0.0, 1.0, 2.0, 5.0]
+fig11_sigma_pct_quick = [0.0, 2.0, 5.0]
+n_ens = 30
+n_ens_quick = 8
+er_dB = [300.0, 40.0, 30.0, 20.0]
+fi_min_GHz = 2.0
+fi_max_GHz = 22.0
+n_fi = 21
+n_fi_quick = 8
+fig7_flo_compare_GHz = [5.0, 5.5]
+fig7_bias_err = [0.0, 0.01, 0.03, 0.1]
+
+[scenarios.multicast]      # одна несущая на три выхода
+carriers = [{f_GHz = 30.0}]
+routes = [{carrier = 1, f_out_GHz = 19.8}, {carrier = 1, f_out_GHz = 12.0}, {carrier = 1, f_out_GHz = 24.0}]
+
+[scenarios.subband]        # перенос поддиапазона: две несущие пары на разные выходы, широкий BPF
+carriers = [{f_GHz = 29.6}, {f_GHz = 29.8}, {f_GHz = 30.0}, {f_GHz = 30.2}]
+routes = [{carrier = 1, f_out_GHz = 19.8}, {carrier = 3, f_out_GHz = 12.0}]
+
+[scenarios.inverted]       # гетеродин выше несущей/2: инверсия спектра (нужно сопряжение)
+carriers = [{f_GHz = 29.6}, {f_GHz = 29.8}]
+routes = [{carrier = 1, f_out_GHz = 19.8, lo = "high"}, {carrier = 2, f_out_GHz = 19.8}]

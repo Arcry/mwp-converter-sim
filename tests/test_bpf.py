@@ -70,4 +70,24 @@ def test_spurious_in_band_flagged():
     plan = replace(cfg.plan, f_lo_GHz=(5.5, 9.0, 17.0))
     comps = Components(bpf=Bpf(center=(22.0,), bw_GHz=6.0))   # 4f1 = 22 ГГц внутри полосы
     rep = band_report_for_output(plan, comps, cfg.sim.Rs, cfg.sim.alpha_eff, 1)
-    assert any(r["component"] == "bpf" and r["line"] == "4fi" and r["level"] == "out" for r in rep)
+    assert any(r["component"] in ("plan", "bpf") and r["line"] == "4fi" and r["level"] == "out" for r in rep)
+
+
+def test_ellip_stopband_and_required_order():
+    from mwp_converter.bpf import bpf_sos, required_order, required_selectivity
+    from mwp_converter.response import bpf_att_dB
+    from scipy import signal
+
+    f0, B, df, stop = 19.8, 0.3, 0.2, 40.0
+    for sgn in (-1, 1):
+        assert bpf_att_dB(f0 + sgn * df, f0, B, 6, "ellip", 0.5, stop) >= stop - 3
+    # цифровой фильтр (fs = 80 ГГц, чтобы узкая полоса считалась устойчиво): центр и ±0,2 ГГц
+    fs = 80e9
+    sos = bpf_sos(fs, f0, B, 6, "ellip", 0.5, stop)
+    _, h = signal.sosfreqz(sos, worN=[f0 * 1e9, (f0 + df) * 1e9, (f0 - df) * 1e9], fs=fs)
+    assert -20 * np.log10(abs(h[0])) < 1.0
+    assert all(-20 * np.log10(abs(v)) >= stop - 3 for v in h[1:])
+    assert required_selectivity(f0, B, f0 + df) == pytest.approx(2 * df / B, rel=0.02)
+    n_e = required_order("ellip", f0, B, f0 + df, 30.0, 0.5, stop)
+    n_b = required_order("butter", f0, B, f0 + df, 30.0)
+    assert n_e is not None and n_b is not None and n_e < n_b

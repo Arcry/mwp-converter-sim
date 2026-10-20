@@ -8,7 +8,7 @@ from optic.utils import parameters
 from .noise import (amp_current_noise, driver_poly, edfa_field, input_noise, lo_table, ou_process,
                     phase_noise)
 from .params import Impairments, resolve_sps
-from .response import apply, band_report
+from .response import apply, apply_ofilt, band_report
 
 ER_IDEAL = 300.0  # дБ: «бесконечный» ER (по умолчанию в OptiCommPy 60 дБ)
 
@@ -99,18 +99,50 @@ class ChannelResult:
     meta: dict = field(default_factory=dict)
 
 
-def _chain(i, plan, sim, imp, comps, baseband, bias1, n):
-    from .signals import rf_drive
+def _setup(plan, sim, baseband, n):
+    """Сетка модели: (SpS, fs, n, x, t, baseband). baseband=None: CW (K = 1 — тон, K > 1 — мультитон)."""
+    from .signals import make_multicarrier_baseband
 
     sps = resolve_sps(plan, sim)
     fs = sps * sim.Rs * 1e9
+    if baseband is None:
+        n = n or sim.n_sym * sps
+        baseband = make_multicarrier_baseband(plan, sim, sps, cw=True, n=n) if plan.K > 1 else None
     if baseband is not None:
         n = len(baseband.x)
         x = baseband.x
     else:
-        n = n or sim.n_sym * sps
         x = np.ones(n, complex)
-    t = np.arange(n) / fs
+    return sps, fs, n, x, np.arange(n) / fs, baseband
+
+
+def _input_stage(plan, sim, imp, comps, baseband, x, t, fs, sps):
+    """Вход МЦМ2, общий для всех веток: композит -> входной шум -> драйв u2 (на f_mid) -> T2.
+
+    T2 = mzm_field(1, u2): комплексная передаточная функция МЦМ2 (поле на выходе при единичном
+    входе); ветка i получает E_e,i = L2 * E_d,i * T2 (МЦМ линеен по полю).
+    """
+    from .signals import drive_stats, rf_drive
+
+    a_max2, span = 1.0, 0.0
+    if hasattr(baseband, "a"):
+        a_max2 = float(np.max(baseband.a) ** 2)
+        span = max(baseband.f_GHz) - min(baseband.f_GHz)
+    x_in = x if imp.input_cn_dB is None else input_noise(x, fs, sps, imp, sim, sim.seed + 200, a_max2, span)
+    u2 = rf_drive(x_in, plan.f_mid() * 1e9, sim.beta_m, sim.Vpi, t)
+    if imp.drivers:
+        u2 = driver_poly(u2, beta_to_drive(sim.beta_m, sim.Vpi), imp.oip3_dBm, imp.hd2_sig_dBc, sim.RL)
+    T2 = mzm_field(np.ones(len(t), complex), u2, "quad", sim.Vpi, imp.er_dB, comps.mzm2_rf, fs)
+    extra = dict(u2_in=u2, u2_mzm=apply(u2, fs, comps.mzm2_rf), x=x, x_in=x_in,
+                 symbols=None if baseband is None else baseband.symbols)
+    if hasattr(baseband, "a"):
+        extra.update(drive_stats(baseband, sim))
+    return T2, extra
+
+
+def _branch(i, plan, sim, imp, comps, T2, fs, t, bias1):
+    """Ветка i: лазер -> МЦМ1 -> MUX -> (x T2, потери) -> [EDFA] -> DEMUX. Возвращает (fields, ase_power)."""
+    n = len(t)
     fi = plan.f_lo_GHz[i] * 1e9
     E0 = laser_field(sim, imp, n, fs, seed=sim.seed + 1000 * (i + 1))
     phi = phase_noise(lo_table(imp), n, fs, sim.seed + 500 * (i + 1)) if imp.lo_pn else 0.0
@@ -124,66 +156,122 @@ def _chain(i, plan, sim, imp, comps, baseband, bias1, n):
     L = [10 ** (-d / 20) for d in imp.loss_dB]   # потери по полю: MZM1, MUX, MZM2, DEMUX
     Ea = L[0] * mzm_field(E0, u1, bias1, sim.Vpi, imp.er_dB, comps.mzm1_rf, fs, imp.bias_err)
     Ed = L[1] * apply(Ea, fs, comps.wdm)
-    x_in = x if imp.input_cn_dB is None else input_noise(x, fs, sps, imp, sim, sim.seed + 200)
-    u2 = rf_drive(x_in, plan.fc_GHz * 1e9, sim.beta_m, sim.Vpi, t)
-    if imp.drivers:
-        u2 = driver_poly(u2, beta_to_drive(sim.beta_m, sim.Vpi), imp.oip3_dBm, imp.hd2_sig_dBc, sim.RL)
-    extra = dict(u2_in=u2, u2_mzm=apply(u2, fs, comps.mzm2_rf), x=x, x_in=x_in,
-                 symbols=None if baseband is None else baseband.symbols, ase_power=None)
-    Ee = L[2] * mzm_field(Ed, u2, "quad", sim.Vpi, imp.er_dB, comps.mzm2_rf, fs)
+    Ee = L[2] * Ed * T2
     n_perp = None
     Eg_in = Ee
     if imp.edfa:
         Eg_in, n_perp = edfa_field(Ee, imp.edfa_G_dB, imp.edfa_NF_dB, fs, sim.seed + 300 * (i + 1),
                                    imp.edfa_lambda_nm, imp.edfa_ase)
     Eg = L[3] * apply(Eg_in, fs, comps.wdm)
+    cen = None if comps.ofilt.is_none else comps.ofilt.centers(plan, i)
+    if cen is not None:                      # оптический фильтр: после DEMUX, до ФД (к E_g и к n_perp)
+        Eg = apply_ofilt(Eg, fs, comps.ofilt, cen)
+    ase = None
     if n_perp is not None and imp.edfa_ase:
-        extra["ase_power"] = np.abs(L[3] * apply(n_perp, fs, comps.wdm)) ** 2
-    return t, fs, dict(a=Ea, d=Ed, e=Ee, g=Eg), extra
+        nf = L[3] * apply(n_perp, fs, comps.wdm)
+        if cen is not None:
+            nf = apply_ofilt(nf, fs, comps.ofilt, cen)
+        ase = np.abs(nf) ** 2
+    return dict(a=Ea, d=Ed, e=Ee, g=Eg), ase
+
+
+def _meta(i, plan, sim, bias1, extra):
+    r = plan.routes[i]
+    return dict(channel=i, bias1=bias1, SpS=resolve_sps(plan, sim), carrier=r.carrier,
+                f_out=plan.line_info(i)[0], sideband=r.sideband, **extra)
+
+
+def _thin_fields(fields, fs, nmax=100000):
+    """Прореженные оптические спектры вместо полных полей: {точка: (f_GHz, дБ)} (max-pooling)."""
+    from .spectra import optical_spectrum
+
+    out = {}
+    for k, E in fields.items():
+        f, p = optical_spectrum(E, fs)
+        if len(f) > nmax:
+            m = int(np.ceil(len(f) / nmax))
+            n = len(f) // m * m
+            f, p = f[:n].reshape(-1, m).mean(1), p[:n].reshape(-1, m).max(1)
+        out[k] = (f, p)
+    return out
 
 
 def run_channel(i, plan, sim, imp, comps, baseband=None, bias1="null", n=None, extra_power=None):
-    """Канал i: laser -> MZM1 -> MUX -> MZM2 -> DEMUX -> PD. baseband=None — CW-тон (x=1)."""
-    t, fs, fields, extra = _chain(i, plan, sim, imp, comps, baseband, bias1, n)
-    ase = extra.pop("ase_power")
+    """Ветка i: laser -> MZM1 -> MUX -> MZM2 -> DEMUX -> PD. baseband=None — CW (тон или мультитон)."""
+    sps, fs, n, x, t, baseband = _setup(plan, sim, baseband, n)
+    T2, extra = _input_stage(plan, sim, imp, comps, baseband, x, t, fs, sps)
+    fields, ase = _branch(i, plan, sim, imp, comps, T2, fs, t, bias1)
     if ase is not None:
         extra_power = ase if extra_power is None else extra_power + ase
     I = photocurrent(fields["g"], sim, imp, comps.pd, fs, seed=sim.seed + 7 * (i + 1),
                      extra_power=extra_power, amp_seed=sim.seed + 11 * (i + 1))
     return ChannelResult(t, fs, fields, I, band_report(plan, comps, sim.Rs, sim.alpha_eff, imp),
-                         dict(channel=i, bias1=bias1, SpS=resolve_sps(plan, sim), **extra))
+                         _meta(i, plan, sim, bias1, extra))
 
 
-def run_all(plan, sim, imp, comps, baseband=None, bias1="null", n=None):
-    """Все каналы; при неидеальном WDM добавляет помехи соседей (некогерентно)."""
-    chains = [_chain(i, plan, sim, imp, comps, baseband, bias1, n) for i in range(len(plan.f_lo_GHz))]
+def run_all(plan, sim, imp, comps, baseband=None, bias1="null", n=None, keep_fields=True, indices=None):
+    """Ветки плана (по умолчанию все), считаются последовательно; общий вход (T2) — один раз.
+
+    При неидеальном WDM добавляет помехи соседей (некогерентно). keep_fields=False: вместо
+    полных оптических полей в ChannelResult.fields лежат прореженные спектры (экономия памяти).
+    """
+    sps, fs, n, x, t, baseband = _setup(plan, sim, baseband, n)
+    T2, extra = _input_stage(plan, sim, imp, comps, baseband, x, t, fs, sps)
+    idx = list(range(plan.N)) if indices is None else list(indices)
     offs = plan.offsets_GHz()
     leak = not comps.wdm.is_ideal and comps.wdm_isolation_dB is not None
     rep = band_report(plan, comps, sim.Rs, sim.alpha_eff, imp)
-    out = []
-    for i, (t, fs, fields, chain_meta) in enumerate(chains):
-        xt = None
-        if leak:
-            xt = sum(10 ** (-comps.wdm_isolation_dB / 10) * np.abs(chains[j][2]["g"]) ** 2
-                     for j in range(len(chains))
-                     if j != i and abs(abs(offs[i] - offs[j]) - plan.wdm_spacing_GHz) < 1e-9)
-            xt = xt if not np.isscalar(xt) else None
-        ase = chain_meta.pop("ase_power")
+    iso = 10 ** (-(comps.wdm_isolation_dB or 0) / 10)
+
+    def pd(i, gpow, ase, xt=None):
+        # ФД зависит только от мощности: поле g не нужно, достаточно |E_g|^2 (float)
         if ase is not None:
             xt = ase if xt is None else xt + ase
-        I = photocurrent(fields["g"], sim, imp, comps.pd, fs, seed=sim.seed + 7 * (i + 1),
-                         extra_power=xt, amp_seed=sim.seed + 11 * (i + 1))
-        out.append(ChannelResult(t, fs, fields, I, rep, dict(channel=i, bias1=bias1,
-                                                              SpS=resolve_sps(plan, sim), **chain_meta)))
+        return photocurrent(np.sqrt(gpow), sim, imp, comps.pd, fs, seed=sim.seed + 7 * (i + 1),
+                            extra_power=xt, amp_seed=sim.seed + 11 * (i + 1))
+
+    def reduce(i, fields):
+        """Поля ветки для результата: полные (keep_fields) либо прореженные спектры + фрагменты."""
+        meta = _meta(i, plan, sim, bias1, extra)
+        if keep_fields:
+            return fields, meta
+        nfr = 8 * sps    # фрагмент полей для вкладки Time (первые 8 символов)
+        meta["frag"] = {k: v[:nfr] for k, v in fields.items()}
+        return _thin_fields(fields, fs), meta
+
+    out = []
+    if not leak:
+        for i in idx:
+            fields, ase = _branch(i, plan, sim, imp, comps, T2, fs, t, bias1)
+            f_out, meta = reduce(i, fields)
+            out.append(ChannelResult(t, fs, f_out, pd(i, np.abs(fields["g"]) ** 2, ase), rep, meta))
+        return out
+    # утечка WDM: ветки считаются последовательно; от каждой хранится только |E_g|^2 (и ASE-мощность)
+    gpow, ases, reduced = {}, {}, {}
+    for i in range(plan.N):
+        fields, ases[i] = _branch(i, plan, sim, imp, comps, T2, fs, t, bias1)
+        gpow[i] = np.abs(fields["g"]) ** 2
+        if i in idx:
+            reduced[i] = reduce(i, fields)
+        del fields
+    for i in idx:
+        xt = sum(iso * gpow[j] for j in range(plan.N)
+                 if j != i and abs(abs(offs[i] - offs[j]) - plan.wdm_spacing_GHz) < 1e-9)
+        f_out, meta = reduced[i]
+        out.append(ChannelResult(t, fs, f_out, pd(i, gpow[i], ases[i], None if np.isscalar(xt) else xt), rep, meta))
     return out
 
 
 def simulate(plan, sim, imp, comps, i=0, bias1="null"):
-    """QPSK/PSK-прогон канала i: возвращает (ChannelResult, Baseband, fs)."""
-    from .signals import make_psk_baseband
+    """Прогон ветки i с модулированным входом: возвращает (ChannelResult, MultiBaseband, fs).
+
+    MultiBaseband проксирует несущую 0 (bits/symbols) и хранит композит x; эталон приёмника
+    несущей k — tx.ref(k).
+    """
+    from .signals import make_multicarrier_baseband
 
     sps = resolve_sps(plan, sim)
-    tx = make_psk_baseband(sim.M, sim.n_sym, sps, sim.alpha, sim.seed, sim.pulse)
+    tx = make_multicarrier_baseband(plan, sim, sps)
     return run_channel(i, plan, sim, imp, comps, baseband=tx, bias1=bias1), tx, sps * sim.Rs * 1e9
 
 
@@ -198,7 +286,7 @@ def measure_lines(i, plan, sim, comps, names, bias1="null", imp=None, n_target=2
 
     imp = imp or Impairments()
     fs = resolve_sps(plan, sim) * sim.Rs * 1e9
-    fi, fc = plan.f_lo_GHz[i], plan.fc_GHz
+    fi, fc = plan.f_lo_GHz[i], plan.fc_of(i)
     allf = [0.0 if k == "DC" else line_freq_GHz(k, fi, fc) for k in LINE_COEFFS]
     n = coherent_length(fs, allf, n_target) or n_target
     res = run_channel(i, plan, sim, imp, comps, bias1=bias1, n=n)
